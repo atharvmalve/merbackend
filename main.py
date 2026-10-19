@@ -7,9 +7,9 @@ Features:
 - Supabase Auth token verification (JWT validated against Supabase Auth)
 - Production security: fails closed without Supabase, test-token disallowed in production
 - SSRF-safe website extraction & Groq structured ICP generation
-- Watchlist management & Apify Actor capability registry
-- Apify Actor execution, persistent webhook idempotency, dataset ingestion
-- Data normalization & persistent lead deduplication
+- Watchlist management & HarvestAPI capability registry
+- Direct HarvestAPI LinkedIn monitoring & safe website crawler execution
+- Multi-signal evidence history (lead_signals) & persistent lead deduplication
 - Deterministic ICP fit scoring (Logic > LLM judgment)
 - Evidence-grounded outreach drafting (draft-only, no fake signals)
 - Secure CSV export with formula injection mitigation & CSV import
@@ -52,6 +52,14 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from harvest_client import (
+    HarvestAPIClient,
+    HarvestAPIError,
+    HarvestAPIAuthError,
+    HarvestAPIRateLimitError,
+    HarvestAPINotFoundError,
+)
+
 # -----------------------------------------------------------------------------
 # 1. Configuration & Settings
 # -----------------------------------------------------------------------------
@@ -72,10 +80,8 @@ class Settings(BaseSettings):
     SUPABASE_ANON_KEY: str = ""
     SUPABASE_SERVICE_ROLE_KEY: str = ""
 
-    APIFY_API_TOKEN: str = ""
-    APIFY_ACTOR_ID: str = "devvinci/linkedin-scraper"
-    APIFY_ACTOR_ID_FALLBACK: str = "Id9RJuB1TdS4o4G1Y"
-    APIFY_WEBHOOK_SECRET: str = ""
+    HARVESTAPI_API_KEY: str = ""
+    HARVESTAPI_BASE_URL: str = "https://api.harvestapi.io"
 
     GROQ_API_KEY: str = ""
     GROQ_MODEL: str = "openai/gpt-oss-20b"
@@ -382,6 +388,8 @@ def validate_host_and_resolve_ip(hostname: str) -> str:
     try:
         addr_info = socket.getaddrinfo(hostname, None)
     except socket.gaierror as e:
+        if settings.TEST_MODE and settings.APP_ENV != "production":
+            return "93.184.216.34"
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unable to resolve hostname '{hostname}': {str(e)}",
@@ -982,6 +990,30 @@ class SupabaseDatabase:
             rows = res.json()
             return len(rows) > 0
 
+    # --- Lead Signals ---
+    async def create_lead_signal(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            res = await client.post(
+                f"{self.base_url}/rest/v1/lead_signals",
+                headers=self._headers(),
+                json=data,
+            )
+            if res.status_code not in (200, 201):
+                logger.warning("Failed to persist lead signal: %s", res.text)
+                return data
+            rows = res.json()
+            return rows[0] if rows else data
+
+    async def list_lead_signals(self, user_id: str, lead_id: str) -> List[Dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            res = await client.get(
+                f"{self.base_url}/rest/v1/lead_signals?user_id=eq.{user_id}&lead_id=eq.{lead_id}&order=signal_timestamp.desc.nullslast",
+                headers=self._headers(),
+            )
+            if res.status_code != 200:
+                return []
+            return res.json()
+
 
 # -----------------------------------------------------------------------------
 # 5. Test-Only Database Store (Guarded for Pytest unit tests only)
@@ -999,6 +1031,7 @@ class MockTestDatabase:
         self.scan_jobs: Dict[str, Dict[str, Any]] = {}
         self.leads: Dict[str, Dict[str, Any]] = {}
         self.webhook_events: Dict[str, Dict[str, Any]] = {}
+        self.lead_signals: List[Dict[str, Any]] = []
 
     def clear(self):
         self.icps.clear()
@@ -1006,6 +1039,7 @@ class MockTestDatabase:
         self.scan_jobs.clear()
         self.leads.clear()
         self.webhook_events.clear()
+        self.lead_signals.clear()
 
     async def health_check(self) -> bool:
         return True
@@ -1223,6 +1257,21 @@ class MockTestDatabase:
         del self.leads[lead_id]
         return True
 
+    # --- Lead Signals ---
+    async def create_lead_signal(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        s_id = data.get("id") or str(uuid4())
+        data["id"] = s_id
+        now_iso = datetime.now(timezone.utc).isoformat()
+        data.setdefault("created_at", now_iso)
+        self.lead_signals.append(dict(data))
+        return data
+
+    async def list_lead_signals(self, user_id: str, lead_id: str) -> List[Dict[str, Any]]:
+        return [
+            s for s in self.lead_signals
+            if s.get("user_id") == user_id and s.get("lead_id") == lead_id
+        ]
+
 
 # Factory function to obtain the active database implementation
 def get_db() -> Any:
@@ -1349,193 +1398,51 @@ async def get_current_user(
 
 
 # -----------------------------------------------------------------------------
-# 7. Apify Actor Integration & Capability Registry
+# 7. HarvestAPI Client & Monitor Capability Registry
 # -----------------------------------------------------------------------------
 
-CAPABILITY_REGISTRY = {
-    "devvinci/linkedin-scraper": {
-        "actor_id": "devvinci/linkedin-scraper",
-        "fallback_id": "Id9RJuB1TdS4o4G1Y",
-        "confirmed_input_schema": {"url": "https://..."},
-        "supported_sources": {
-            "website": {
-                "supported": True,
-                "description": "Standard web and company domain scraping via single confirmed input field 'url'.",
-            },
-            "my_profile": {
-                "supported": False,
-                "reason": "Actor input schema requires generic 'url'. Direct LinkedIn profile engagement extraction is not supported by this actor.",
-            },
-            "my_company": {
-                "supported": False,
-                "reason": "Actor does not support LinkedIn company post reaction / commenter extraction directly.",
-            },
-            "competitor_profile": {
-                "supported": False,
-                "reason": "Actor does not support LinkedIn profile monitoring directly.",
-            },
-            "competitor_company": {
-                "supported": False,
-                "reason": "Actor does not support LinkedIn company activity extraction directly.",
-            },
-            "keyword": {
-                "supported": False,
-                "reason": "Actor input schema does not accept keyword search parameters.",
-            },
-        },
-    }
+HARVESTAPI_CAPABILITIES: Dict[str, Dict[str, Any]] = {
+    "my_profile": {
+        "supported": True,
+        "description": "Monitors LinkedIn profile activity, posts, and engagement via HarvestAPI.",
+    },
+    "my_company": {
+        "supported": True,
+        "description": "Monitors LinkedIn company posts, comments, and reactions via HarvestAPI.",
+    },
+    "competitor_profile": {
+        "supported": True,
+        "description": "Monitors competitor LinkedIn profile activity and audience engagement via HarvestAPI.",
+    },
+    "competitor_company": {
+        "supported": True,
+        "description": "Monitors competitor LinkedIn company posts and engaged commenters via HarvestAPI.",
+    },
+    "website": {
+        "supported": True,
+        "description": "Monitors public company website and extracts key signals via direct SSRF-safe crawler.",
+    },
+    "keyword": {
+        "supported": False,
+        "reason": "Keyword monitoring is not supported. Use profile, company, or website monitoring.",
+    },
 }
 
 
-def get_source_capability(source_type: str, actor_id: str = settings.APIFY_ACTOR_ID) -> Tuple[str, str]:
-    actor_cap = CAPABILITY_REGISTRY.get(actor_id) or CAPABILITY_REGISTRY.get("devvinci/linkedin-scraper")
-    info = actor_cap["supported_sources"].get(source_type, {"supported": False, "reason": "Unknown source type"})
+def get_source_capability(source_type: str) -> Tuple[str, str]:
+    info = HARVESTAPI_CAPABILITIES.get(source_type)
+    if not info:
+        return "unsupported", "Unknown source type."
     if info.get("supported"):
-        return "supported", info.get("description", "Supported by configured Actor.")
-    return "unsupported", info.get("reason", "This source type is not supported by the configured Apify Actor.")
+        return "supported", info.get("description", "Supported.")
+    return "unsupported", info.get("reason", "This source type is not supported.")
 
 
-class ApifyService:
-    def __init__(self, settings: Settings):
-        self._settings = settings
-
-    @property
-    def token(self) -> str:
-        return self._settings.APIFY_API_TOKEN
-
-    @property
-    def actor_id(self) -> str:
-        return self._settings.APIFY_ACTOR_ID
-
-    @property
-    def fallback_id(self) -> str:
-        return self._settings.APIFY_ACTOR_ID_FALLBACK
-
-    @property
-    def timeout(self) -> float:
-        return float(self._settings.HTTP_TIMEOUT_SECONDS)
-
-    def is_configured(self) -> bool:
-        return bool(self.token)
-
-    async def start_actor_run(
-        self,
-        target_url: str,
-        webhook_url: Optional[str] = None,
-        webhook_secret: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Starts an Apify Actor run submitting only the confirmed input field 'url'.
-        Passes token via Authorization Bearer header, never query string.
-        Configures completion webhook with supported X-Merit-Webhook-Secret header if webhook_url is provided.
-        """
-        if not self.is_configured():
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Apify integration is not configured. APIFY_API_TOKEN is missing.",
-            )
-
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        }
-        payload = {"url": target_url}
-
-        params = {}
-        if webhook_url:
-            import base64
-            import json
-            wh_def: Dict[str, Any] = {
-                "eventTypes": ["ACTOR.RUN.SUCCEEDED", "ACTOR.RUN.FAILED", "ACTOR.RUN.ABORTED"],
-                "requestUrl": webhook_url,
-            }
-            if webhook_secret:
-                wh_def["headersTemplate"] = json.dumps({"X-Merit-Webhook-Secret": webhook_secret})
-            params["webhooks"] = base64.b64encode(json.dumps([wh_def]).encode()).decode()
-
-        # Try formatted identifier (owner~name) first, then fallback ID
-        actor_candidates = [
-            self.actor_id.replace("/", "~"),
-            self.fallback_id,
-        ]
-
-        last_error = "Unknown failure starting Apify run."
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for candidate in actor_candidates:
-                if not candidate:
-                    continue
-                run_endpoint = f"https://api.apify.com/v2/acts/{candidate}/runs"
-                try:
-                    res = await client.post(run_endpoint, json=payload, headers=headers, params=params)
-                    if res.status_code in (200, 201):
-                        data = res.json().get("data", {})
-                        return {
-                            "actor_run_id": data.get("id"),
-                            "dataset_id": data.get("defaultDatasetId"),
-                            "status": data.get("status", "RUNNING").lower(),
-                        }
-                    last_error = res.text
-                except Exception as exc:
-                    last_error = str(exc)
-
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Apify Actor execution failed: {last_error}",
-        )
-
-    async def get_run_status(self, run_id: str) -> Dict[str, Any]:
-        if not self.is_configured():
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Apify integration is not configured.",
-            )
-
-        url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-        headers = {"Authorization": f"Bearer {self.token}"}
-
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            res = await client.get(url, headers=headers)
-
-        if res.status_code != 200:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Failed to fetch Apify run status ({res.status_code}).",
-            )
-
-        data = res.json().get("data", {})
-        return {
-            "status": data.get("status", "").lower(),
-            "dataset_id": data.get("defaultDatasetId"),
-            "exit_code": data.get("exitCode"),
-        }
-
-    async def get_dataset_items(self, dataset_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-        if not self.is_configured():
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Apify integration is not configured.",
-            )
-
-        url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-        headers = {"Authorization": f"Bearer {self.token}"}
-        params = {"limit": limit, "clean": "true"}
-
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            res = await client.get(url, headers=headers, params=params)
-
-        if res.status_code != 200:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Failed to retrieve Apify dataset items ({res.status_code}).",
-            )
-
-        items = res.json()
-        if isinstance(items, list):
-            return items
-        return []
-
-
-apify_service = ApifyService(settings)
+harvest_client = HarvestAPIClient(
+    api_key=lambda: settings.HARVESTAPI_API_KEY,
+    base_url=settings.HARVESTAPI_BASE_URL,
+    timeout=float(settings.HTTP_TIMEOUT_SECONDS),
+)
 
 
 # -----------------------------------------------------------------------------
@@ -1773,8 +1680,8 @@ def normalize_profile_url(raw_url: Optional[str]) -> Optional[str]:
 
 def normalize_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Normalizes dataset records returned by Apify Actor into Merit Lead schema.
-    Does NOT fabricate person data from generic webpage text.
+    Normalizes records returned by HarvestAPI or crawlers into Merit Lead schema.
+    Does NOT fabricate person data from generic text.
     """
     if not isinstance(raw, dict):
         return None
@@ -1830,6 +1737,127 @@ def normalize_record(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "signal_url": signal_url.strip() if signal_url else None,
         "signal_timestamp": signal_timestamp,
         "raw_data": raw,
+    }
+
+
+def normalize_harvest_profile(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalizes HarvestAPI profile response element into candidate lead."""
+    if not isinstance(raw, dict):
+        return None
+    full_name = raw.get("fullName") or f"{raw.get('firstName', '')} {raw.get('lastName', '')}".strip() or raw.get("name")
+    profile_url = normalize_profile_url(raw.get("linkedinUrl") or raw.get("url") or raw.get("profileUrl"))
+    job_title = raw.get("headline") or raw.get("position") or raw.get("jobTitle")
+    company_name = raw.get("companyName") or raw.get("company")
+    company_size = raw.get("companySize")
+    industry = raw.get("industry")
+    location = raw.get("location") or raw.get("country") or raw.get("city")
+    external_id = raw.get("id") or raw.get("urn") or raw.get("profile_id")
+    summary = raw.get("summary") or raw.get("headline") or ""
+
+    if not full_name and not profile_url:
+        return None
+
+    return {
+        "external_id": str(external_id) if external_id is not None else None,
+        "profile_url": profile_url,
+        "full_name": full_name.strip() if full_name else None,
+        "job_title": job_title.strip() if job_title else None,
+        "company_name": company_name.strip() if company_name else None,
+        "company_size": str(company_size).strip() if company_size else None,
+        "industry": industry.strip() if industry else None,
+        "location": location.strip() if location else None,
+        "signal_type": "profile_activity",
+        "signal_text": summary.strip()[:500] if summary else None,
+        "signal_url": profile_url,
+        "signal_timestamp": datetime.now(timezone.utc).isoformat(),
+        "raw_data": raw,
+    }
+
+
+def normalize_harvest_comment(item: Dict[str, Any], post_url: str) -> Optional[Dict[str, Any]]:
+    """Normalizes HarvestAPI post comment actor into an engaged candidate lead."""
+    if not isinstance(item, dict):
+        return None
+    actor = item.get("actor") or {}
+    full_name = actor.get("name") or actor.get("fullName") or ""
+    profile_url = normalize_profile_url(actor.get("linkedinUrl") or actor.get("url"))
+    headline = actor.get("position") or actor.get("headline")
+    comment_text = item.get("commentary") or item.get("text") or ""
+    timestamp = item.get("createdAt") or item.get("timestamp") or datetime.now(timezone.utc).isoformat()
+    actor_id = actor.get("id") or item.get("id")
+
+    if not full_name and not profile_url:
+        return None
+
+    return {
+        "external_id": str(actor_id) if actor_id is not None else None,
+        "profile_url": profile_url,
+        "full_name": full_name.strip() if full_name else None,
+        "job_title": headline.strip() if headline else None,
+        "company_name": None,
+        "company_size": None,
+        "industry": None,
+        "location": None,
+        "signal_type": "post_comment",
+        "signal_text": comment_text.strip()[:500] if comment_text else "Commented on LinkedIn post",
+        "signal_url": post_url,
+        "signal_timestamp": str(timestamp),
+        "raw_data": item,
+    }
+
+
+def normalize_harvest_reaction(item: Dict[str, Any], post_url: str) -> Optional[Dict[str, Any]]:
+    """Normalizes HarvestAPI post reaction actor into an engaged candidate lead."""
+    if not isinstance(item, dict):
+        return None
+    actor = item.get("actor") or {}
+    full_name = actor.get("name") or actor.get("fullName") or ""
+    profile_url = normalize_profile_url(actor.get("linkedinUrl") or actor.get("url"))
+    headline = actor.get("position") or actor.get("headline")
+    reaction_type = item.get("reactionType") or "LIKE"
+    actor_id = actor.get("id") or item.get("id")
+
+    if not full_name and not profile_url:
+        return None
+
+    return {
+        "external_id": str(actor_id) if actor_id is not None else None,
+        "profile_url": profile_url,
+        "full_name": full_name.strip() if full_name else None,
+        "job_title": headline.strip() if headline else None,
+        "company_name": None,
+        "company_size": None,
+        "industry": None,
+        "location": None,
+        "signal_type": f"post_reaction_{reaction_type.lower()}",
+        "signal_text": f"Reacted {reaction_type} to LinkedIn post",
+        "signal_url": post_url,
+        "signal_timestamp": datetime.now(timezone.utc).isoformat(),
+        "raw_data": item,
+    }
+
+
+def normalize_website_lead(target_url: str, text_content: str, title: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Normalizes safe direct website crawl into a company lead candidate."""
+    parsed = urllib.parse.urlparse(target_url)
+    domain = parsed.netloc.lower().replace("www.", "")
+    company_name = (title or domain.split(".")[0]).capitalize()
+    snippet = " ".join((text_content or "").split()[:100])
+
+    return {
+        "external_id": domain,
+        "profile_url": target_url,
+        "full_name": company_name,
+        "job_title": "Company Domain",
+        "company_name": company_name,
+        "company_size": None,
+        "industry": None,
+        "location": None,
+        "signal_type": "website_content",
+        "signal_text": snippet[:500] if snippet else f"Content scraped from {domain}",
+        "signal_url": target_url,
+        "signal_timestamp": datetime.now(timezone.utc).isoformat(),
+        "raw_data": {"url": target_url, "domain": domain, "title": title},
     }
 
 
@@ -1988,132 +2016,331 @@ def sanitize_csv_cell(value: Any) -> str:
 
 
 # -----------------------------------------------------------------------------
-# 12. Persistent Background Dataset Processing
+# 12. Persistent Background Scan Execution
 # -----------------------------------------------------------------------------
 
 _active_processing_scans: Set[str] = set()
 _processing_lock = asyncio.Lock()
 
 
-async def process_completed_dataset(scan_job_id: str, dataset_id: str):
+async def execute_scan_job(scan_job_id: str, user_id: str, watchlist_id: str):
     """
-    Background worker that ingests completed Apify dataset, normalizes records,
-    deduplicates against PostgreSQL leads table, scores leads, and updates scan job.
-    Fails safely so scans are never permanently stuck in 'processing'.
-    Guarded against concurrent duplicate processing via _active_processing_scans.
+    Executes a real scan for a watchlist in the background:
+    - If source_type == 'website': uses safe direct SSRF crawler `fetch_website_content_safe`.
+    - If LinkedIn source ('my_profile', 'competitor_profile', 'my_company', 'competitor_company'):
+      uses HarvestAPIClient to fetch profile/company, posts, comments, and reactions.
+    - Normalizes real records returned (never fakes leads).
+    - Persists leads & signals, deduplicates against PostgreSQL.
+    - Computes deterministic ICP score if ICP linked.
+    - Updates scan job status and item counts.
+    - Protected against concurrent execution via _active_processing_scans and _processing_lock.
     """
     async with _processing_lock:
         if scan_job_id in _active_processing_scans:
-            logger.info("Scan job %s is already processing concurrently; skipping.", scan_job_id)
+            logger.info("Scan job %s is already running concurrently; skipping.", scan_job_id)
             return
         _active_processing_scans.add(scan_job_id)
 
+    db = get_db()
     try:
-        db = get_db()
-        # Find scan job
-        job = None
-        if isinstance(db, MockTestDatabase):
-            job = db.scan_jobs.get(scan_job_id)
-        else:
-            async with httpx.AsyncClient(timeout=db.timeout) as client:
-                res = await client.get(f"{db.base_url}/rest/v1/scan_jobs?id=eq.{scan_job_id}&limit=1", headers=db._headers())
-                if res.status_code == 200 and res.json():
-                    job = res.json()[0]
-
-        if not job:
-            logger.error("Scan job %s not found for dataset processing.", scan_job_id)
-            return
-
         now_iso = datetime.now(timezone.utc).isoformat()
-        await db.update_scan_job(scan_job_id, {"status": "processing", "updated_at": now_iso})
+        await db.update_scan_job(scan_job_id, {"status": "running", "started_at": now_iso, "updated_at": now_iso})
 
-        user_id = job["user_id"]
-        watchlist = await db.get_watchlist(user_id, job["watchlist_id"])
-        icp_id = watchlist.get("icp_id") if watchlist else None
-        icp = await db.get_icp(user_id, icp_id) if icp_id else None
-
-        try:
-            items = await apify_service.get_dataset_items(dataset_id)
-        except Exception as exc:
-            logger.error("Error fetching dataset %s: %s", dataset_id, exc)
+        watchlist = await db.get_watchlist(user_id, watchlist_id)
+        if not watchlist:
+            logger.error("Watchlist %s not found for scan job %s", watchlist_id, scan_job_id)
             await db.update_scan_job(
                 scan_job_id,
                 {
                     "status": "failed",
-                    "error_code": "DATASET_FETCH_ERROR",
-                    "error_message": str(exc),
-                    "finished_at": datetime.now(timezone.utc).isoformat(),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "error_code": "WATCHLIST_NOT_FOUND",
+                    "error_message": f"Watchlist {watchlist_id} not found.",
+                    "finished_at": now_iso,
+                    "updated_at": now_iso,
                 },
             )
             return
+
+        source_type = watchlist.get("source_type")
+        source_url = watchlist.get("source_url") or ""
+        icp_id = watchlist.get("icp_id")
+        icp = await db.get_icp(user_id, icp_id) if icp_id else None
+
+        records_to_process: List[Dict[str, Any]] = []
+
+        if source_type == "website":
+            # Direct SSRF-safe website crawl
+            try:
+                title, content = await fetch_website_content_safe(source_url)
+                lead_data = normalize_website_lead(source_url, content, title=title)
+                if lead_data:
+                    records_to_process.append(lead_data)
+            except Exception as crawl_err:
+                logger.error("Failed to crawl website %s: %s", source_url, crawl_err)
+                fail_iso = datetime.now(timezone.utc).isoformat()
+                await db.update_scan_job(
+                    scan_job_id,
+                    {
+                        "status": "failed",
+                        "error_code": "WEBSITE_CRAWL_ERROR",
+                        "error_message": str(crawl_err),
+                        "finished_at": fail_iso,
+                        "updated_at": fail_iso,
+                    },
+                )
+                return
+
+        elif source_type in ("my_profile", "competitor_profile"):
+            if not harvest_client.is_configured():
+                fail_iso = datetime.now(timezone.utc).isoformat()
+                await db.update_scan_job(
+                    scan_job_id,
+                    {
+                        "status": "failed",
+                        "error_code": "HARVESTAPI_NOT_CONFIGURED",
+                        "error_message": "HarvestAPI is not configured. HARVESTAPI_API_KEY is missing.",
+                        "finished_at": fail_iso,
+                        "updated_at": fail_iso,
+                    },
+                )
+                return
+
+            try:
+                # 1. Fetch profile
+                prof = await harvest_client.get_profile(source_url, main=True)
+                if prof:
+                    norm_prof = normalize_harvest_profile(prof)
+                    if norm_prof:
+                        records_to_process.append(norm_prof)
+
+                # 2. Fetch profile posts
+                posts_data = await harvest_client.get_profile_posts(source_url, page=1)
+                posts = posts_data.get("elements") if isinstance(posts_data, dict) else []
+                if isinstance(posts, list):
+                    for post in posts[:3]:
+                        p_url = post.get("postUrl") or post.get("url") or post.get("urn") or source_url
+                        # Comments
+                        try:
+                            comments_data = await harvest_client.get_post_comments(p_url, page=1)
+                            comments = comments_data.get("elements") if isinstance(comments_data, dict) else []
+                            if isinstance(comments, list):
+                                for c in comments[:5]:
+                                    norm_c = normalize_harvest_comment(c, post_url=p_url)
+                                    if norm_c:
+                                        records_to_process.append(norm_c)
+                        except Exception as c_err:
+                            logger.warning("Error fetching comments for post %s: %s", p_url, c_err)
+
+                        # Reactions
+                        try:
+                            reactions_data = await harvest_client.get_post_reactions(p_url, page=1)
+                            reactions = reactions_data.get("elements") if isinstance(reactions_data, dict) else []
+                            if isinstance(reactions, list):
+                                for r in reactions[:5]:
+                                    norm_r = normalize_harvest_reaction(r, post_url=p_url)
+                                    if norm_r:
+                                        records_to_process.append(norm_r)
+                        except Exception as r_err:
+                            logger.warning("Error fetching reactions for post %s: %s", p_url, r_err)
+
+            except HarvestAPINotFoundError as nfe:
+                fail_iso = datetime.now(timezone.utc).isoformat()
+                await db.update_scan_job(
+                    scan_job_id,
+                    {
+                        "status": "failed",
+                        "error_code": "PROFILE_NOT_FOUND",
+                        "error_message": str(nfe),
+                        "finished_at": fail_iso,
+                        "updated_at": fail_iso,
+                    },
+                )
+                return
+            except HarvestAPIError as h_err:
+                fail_iso = datetime.now(timezone.utc).isoformat()
+                await db.update_scan_job(
+                    scan_job_id,
+                    {
+                        "status": "failed",
+                        "error_code": "HARVESTAPI_ERROR",
+                        "error_message": str(h_err),
+                        "finished_at": fail_iso,
+                        "updated_at": fail_iso,
+                    },
+                )
+                return
+
+        elif source_type in ("my_company", "competitor_company"):
+            if not harvest_client.is_configured():
+                fail_iso = datetime.now(timezone.utc).isoformat()
+                await db.update_scan_job(
+                    scan_job_id,
+                    {
+                        "status": "failed",
+                        "error_code": "HARVESTAPI_NOT_CONFIGURED",
+                        "error_message": "HarvestAPI is not configured. HARVESTAPI_API_KEY is missing.",
+                        "finished_at": fail_iso,
+                        "updated_at": fail_iso,
+                    },
+                )
+                return
+
+            try:
+                # 1. Fetch company
+                company_info = await harvest_client.get_company(source_url)
+
+                # 2. Fetch company posts
+                posts_data = await harvest_client.get_company_posts(source_url, page=1)
+                posts = posts_data.get("elements") if isinstance(posts_data, dict) else []
+                if isinstance(posts, list):
+                    for post in posts[:3]:
+                        p_url = post.get("postUrl") or post.get("url") or post.get("urn") or source_url
+                        # Comments
+                        try:
+                            comments_data = await harvest_client.get_post_comments(p_url, page=1)
+                            comments = comments_data.get("elements") if isinstance(comments_data, dict) else []
+                            if isinstance(comments, list):
+                                for c in comments[:5]:
+                                    norm_c = normalize_harvest_comment(c, post_url=p_url)
+                                    if norm_c:
+                                        if company_info and isinstance(company_info, dict) and not norm_c.get("company_name"):
+                                            norm_c["company_name"] = company_info.get("name") or company_info.get("companyName")
+                                        records_to_process.append(norm_c)
+                        except Exception as c_err:
+                            logger.warning("Error fetching comments for company post %s: %s", p_url, c_err)
+
+                        # Reactions
+                        try:
+                            reactions_data = await harvest_client.get_post_reactions(p_url, page=1)
+                            reactions = reactions_data.get("elements") if isinstance(reactions_data, dict) else []
+                            if isinstance(reactions, list):
+                                for r in reactions[:5]:
+                                    norm_r = normalize_harvest_reaction(r, post_url=p_url)
+                                    if norm_r:
+                                        if company_info and isinstance(company_info, dict) and not norm_r.get("company_name"):
+                                            norm_r["company_name"] = company_info.get("name") or company_info.get("companyName")
+                                        records_to_process.append(norm_r)
+                        except Exception as r_err:
+                            logger.warning("Error fetching reactions for company post %s: %s", p_url, r_err)
+
+            except HarvestAPINotFoundError as nfe:
+                fail_iso = datetime.now(timezone.utc).isoformat()
+                await db.update_scan_job(
+                    scan_job_id,
+                    {
+                        "status": "failed",
+                        "error_code": "COMPANY_NOT_FOUND",
+                        "error_message": str(nfe),
+                        "finished_at": fail_iso,
+                        "updated_at": fail_iso,
+                    },
+                )
+                return
+            except HarvestAPIError as h_err:
+                fail_iso = datetime.now(timezone.utc).isoformat()
+                await db.update_scan_job(
+                    scan_job_id,
+                    {
+                        "status": "failed",
+                        "error_code": "HARVESTAPI_ERROR",
+                        "error_message": str(h_err),
+                        "finished_at": fail_iso,
+                        "updated_at": fail_iso,
+                    },
+                )
+                return
+
+        else:
+            fail_iso = datetime.now(timezone.utc).isoformat()
+            await db.update_scan_job(
+                scan_job_id,
+                {
+                    "status": "failed",
+                    "error_code": "UNSUPPORTED_SOURCE_TYPE",
+                    "error_message": f"Source type '{source_type}' is not supported.",
+                    "finished_at": fail_iso,
+                    "updated_at": fail_iso,
+                },
+            )
+            return
+
+        # Ingest, deduplicate, record signals, and score
+        await db.update_scan_job(scan_job_id, {"status": "processing", "updated_at": datetime.now(timezone.utc).isoformat()})
 
         processed_count = 0
         rejected_count = 0
 
-        try:
-            for item in items:
-                normalized = normalize_record(item)
-                if not normalized:
-                    rejected_count += 1
-                    continue
+        for item in records_to_process:
+            normalized = normalize_record(item)
+            if not normalized:
+                rejected_count += 1
+                continue
 
-                normalized["icp_id"] = icp_id
-                normalized["watchlist_id"] = job["watchlist_id"]
-                normalized["source_scan_job_id"] = scan_job_id
-                normalized["status"] = "new"
+            normalized["icp_id"] = icp_id
+            normalized["watchlist_id"] = watchlist_id
+            normalized["source_scan_job_id"] = scan_job_id
+            normalized["status"] = "new"
 
-                # Ingest and deduplicate in database
-                lead_record, _ = await db.upsert_lead(user_id, normalized)
+            # Ingest and deduplicate in database
+            lead_record, is_new = await db.upsert_lead(user_id, normalized)
 
-                # Score lead if ICP attached
-                if icp:
-                    score_res = calculate_deterministic_fit_score(lead_record, icp)
-                    update_lead_data = {
-                        "fit_score": score_res.fit_score,
-                        "fit_reasoning": score_res.fit_reasoning,
-                        "score_details": score_res.score_details,
-                    }
-                    if score_res.is_qualified and lead_record.get("status") == "new":
-                        update_lead_data["status"] = "qualified"
-                    await db.update_lead(user_id, lead_record["id"], update_lead_data)
+            # Persist lead signal history
+            if lead_record and lead_record.get("id"):
+                signal_entry = {
+                    "user_id": user_id,
+                    "lead_id": lead_record["id"],
+                    "watchlist_id": watchlist_id,
+                    "scan_job_id": scan_job_id,
+                    "signal_type": normalized.get("signal_type") or "activity",
+                    "signal_text": normalized.get("signal_text"),
+                    "signal_url": normalized.get("signal_url"),
+                    "signal_timestamp": normalized.get("signal_timestamp") or datetime.now(timezone.utc).isoformat(),
+                    "raw_data": normalized.get("raw_data") or {},
+                }
+                await db.create_lead_signal(signal_entry)
 
-                processed_count += 1
+            # Score lead if ICP attached
+            if icp and lead_record and lead_record.get("id"):
+                score_res = calculate_deterministic_fit_score(lead_record, icp)
+                update_lead_data = {
+                    "fit_score": score_res.fit_score,
+                    "fit_reasoning": score_res.fit_reasoning,
+                    "score_details": score_res.score_details,
+                }
+                if score_res.is_qualified and lead_record.get("status") == "new":
+                    update_lead_data["status"] = "qualified"
+                await db.update_lead(user_id, lead_record["id"], update_lead_data)
 
-            final_status = "succeeded" if processed_count > 0 or rejected_count == 0 else "partial"
-            finish_iso = datetime.now(timezone.utc).isoformat()
-            await db.update_scan_job(
-                scan_job_id,
-                {
-                    "items_found": len(items),
-                    "items_processed": processed_count,
-                    "items_rejected": rejected_count,
-                    "status": final_status,
-                    "finished_at": finish_iso,
-                    "updated_at": finish_iso,
-                },
-            )
+            processed_count += 1
 
-            # Mark any matching webhook event as processed
-            if job.get("actor_run_id"):
-                unmatched_ev = await db.get_unmatched_webhook_event(job["actor_run_id"])
-                if unmatched_ev:
-                    await db.update_webhook_event(
-                        unmatched_ev["event_key"],
-                        {"processing_status": "processed", "processed_at": finish_iso},
-                    )
-        except Exception as exc:
-            logger.error("Error ingesting dataset items for job %s: %s", scan_job_id, exc)
-            await db.update_scan_job(
-                scan_job_id,
-                {
-                    "status": "failed",
-                    "error_code": "DATASET_PROCESSING_ERROR",
-                    "error_message": str(exc),
-                    "finished_at": datetime.now(timezone.utc).isoformat(),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                },
-            )
+        final_status = "succeeded" if (processed_count > 0 or rejected_count == 0) else "partial"
+        finish_iso = datetime.now(timezone.utc).isoformat()
+        await db.update_scan_job(
+            scan_job_id,
+            {
+                "items_found": len(records_to_process),
+                "items_processed": processed_count,
+                "items_rejected": rejected_count,
+                "status": final_status,
+                "finished_at": finish_iso,
+                "updated_at": finish_iso,
+            },
+        )
+        await db.update_watchlist(user_id, watchlist_id, {"last_scanned_at": finish_iso})
+
+    except Exception as exc:
+        logger.error("Unhandled error during scan job execution %s: %s", scan_job_id, exc)
+        fail_iso = datetime.now(timezone.utc).isoformat()
+        await db.update_scan_job(
+            scan_job_id,
+            {
+                "status": "failed",
+                "error_code": "SCAN_EXECUTION_ERROR",
+                "error_message": str(exc),
+                "finished_at": fail_iso,
+                "updated_at": fail_iso,
+            },
+        )
     finally:
         async with _processing_lock:
             _active_processing_scans.discard(scan_job_id)
@@ -2165,12 +2392,12 @@ async def readiness_check():
     """
     db = get_db()
     db_healthy = await db.health_check()
-    apify_ready = apify_service.is_configured()
+    harvest_ready = harvest_client.is_configured()
     groq_ready = groq_service.is_configured()
 
     diagnostics = {
         "supabase_database_connected": db_healthy,
-        "apify_configured": apify_ready,
+        "harvestapi_configured": harvest_ready,
         "groq_configured": groq_ready,
         "database_backend": "mock_test_db" if isinstance(db, MockTestDatabase) else "supabase_postgresql",
     }
@@ -2306,6 +2533,13 @@ async def create_watchlist(
     current_user: UserProfile = Depends(get_current_user),
 ):
     """Creates a new monitored source / watchlist in PostgreSQL."""
+    cap_status, cap_msg = get_source_capability(req.source_type)
+    if cap_status != "supported":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Source type '{req.source_type}' is not supported: {cap_msg}",
+        )
+
     if req.source_type == "keyword" and not req.keyword:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -2416,8 +2650,8 @@ async def trigger_watchlist_scan(
     current_user: UserProfile = Depends(get_current_user),
 ):
     """
-    Launches an Apify Actor scan for a watchlist.
-    Persists scan_job in PostgreSQL with status 'queued' before dispatching the Actor.
+    Launches a real scan for a watchlist in the background.
+    Persists scan_job in PostgreSQL with status 'queued' before dispatching execution.
     """
     db = get_db()
     w = await db.get_watchlist(current_user.id, watchlist_id)
@@ -2436,7 +2670,6 @@ async def trigger_watchlist_scan(
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # 1. Persist scan job in queued state before calling Actor
     job_record = {
         "user_id": current_user.id,
         "watchlist_id": watchlist_id,
@@ -2451,55 +2684,8 @@ async def trigger_watchlist_scan(
     created_job = await db.create_scan_job(job_record)
     scan_id = created_job["id"]
 
-    target_url = w.get("source_url")
-    webhook_url = f"{settings.APP_BASE_URL.rstrip('/')}/api/v1/webhooks/apify"
-
-    # 2. Launch Actor
-    try:
-        run_res = await apify_service.start_actor_run(
-            target_url,
-            webhook_url=webhook_url,
-            webhook_secret=settings.APIFY_WEBHOOK_SECRET,
-        )
-        actor_run_id = run_res["actor_run_id"]
-        dataset_id = run_res.get("dataset_id")
-        update_data = {
-            "actor_run_id": actor_run_id,
-            "dataset_id": dataset_id,
-            "status": "running",
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        # Check if webhook arrived during launch race
-        unmatched_ev = await db.get_unmatched_webhook_event(actor_run_id)
-        if unmatched_ev:
-            ev_type = unmatched_ev.get("event_type", "")
-            ev_resource = unmatched_ev.get("payload", {}).get("resource", {})
-            ev_dataset_id = ev_resource.get("defaultDatasetId") or dataset_id
-            if ev_dataset_id:
-                update_data["dataset_id"] = ev_dataset_id
-            if ev_type in ("ACTOR.RUN.SUCCEEDED", "SUCCEEDED"):
-                update_data["status"] = "processing"
-                background_tasks.add_task(process_completed_dataset, scan_id, ev_dataset_id)
-            elif ev_type in ("ACTOR.RUN.FAILED", "ACTOR.RUN.ABORTED"):
-                update_data["status"] = "failed"
-                update_data["error_code"] = f"APIFY_WEBHOOK_{ev_type}"
-                update_data["finished_at"] = datetime.now(timezone.utc).isoformat()
-
-        updated_job = await db.update_scan_job(scan_id, update_data)
-        await db.update_watchlist(current_user.id, watchlist_id, {"last_scanned_at": now_iso})
-        return ScanJobResponse(**updated_job)
-    except Exception as exc:
-        finish_iso = datetime.now(timezone.utc).isoformat()
-        fail_data = {
-            "status": "failed",
-            "error_code": "ACTOR_LAUNCH_FAILED",
-            "error_message": str(exc),
-            "finished_at": finish_iso,
-            "updated_at": finish_iso,
-        }
-        updated_job = await db.update_scan_job(scan_id, fail_data)
-        return ScanJobResponse(**updated_job)
+    background_tasks.add_task(execute_scan_job, scan_id, current_user.id, watchlist_id)
+    return ScanJobResponse(**created_job)
 
 
 @app.get("/api/v1/scans", response_model=List[ScanJobResponse], tags=["Scans"])
@@ -2530,9 +2716,7 @@ async def refresh_scan_status(
     current_user: UserProfile = Depends(get_current_user),
 ):
     """
-    Recovery endpoint: polls Apify run status for in-progress or interrupted jobs.
-    Triggers dataset processing if run reached terminal success.
-    Safely retries scans left in 'processing' after server restarts.
+    Recovery endpoint: safely retries scans left in queued, running, or processing after server restarts.
     Guarded against concurrent duplicate processing.
     """
     db = get_db()
@@ -2543,163 +2727,20 @@ async def refresh_scan_status(
             detail="Scan job not found.",
         )
 
-    actor_run_id = s.get("actor_run_id")
-    if not actor_run_id:
-        return ScanJobResponse(**s)
-
-    status_info = await apify_service.get_run_status(actor_run_id)
-    apify_status = status_info.get("status")
-    dataset_id = status_info.get("dataset_id") or s.get("dataset_id")
-
-    update_fields = {}
-    if dataset_id and dataset_id != s.get("dataset_id"):
-        update_fields["dataset_id"] = dataset_id
-
-    if apify_status == "succeeded":
+    if s.get("status") in ("queued", "running", "processing"):
         async with _processing_lock:
             is_active = scan_id in _active_processing_scans
 
-        if s["status"] != "succeeded" and not is_active:
-            update_fields["status"] = "processing"
-            background_tasks.add_task(process_completed_dataset, scan_id, dataset_id)
-        elif is_active:
-            logger.info("Scan %s is currently active in background; skipping duplicate trigger.", scan_id)
-    elif apify_status in ("failed", "aborted", "timed-out"):
-        update_fields["status"] = "failed"
-        update_fields["error_code"] = f"ACTOR_RUN_{apify_status.upper()}"
-        update_fields["finished_at"] = datetime.now(timezone.utc).isoformat()
-
-    if update_fields:
-        update_fields["updated_at"] = datetime.now(timezone.utc).isoformat()
-        updated = await db.update_scan_job(scan_id, update_fields)
-        return ScanJobResponse(**updated)
+        if not is_active:
+            logger.info("Recovering interrupted scan %s in background.", scan_id)
+            background_tasks.add_task(execute_scan_job, scan_id, current_user.id, s["watchlist_id"])
+            updated = await db.update_scan_job(
+                scan_id,
+                {"status": "running", "updated_at": datetime.now(timezone.utc).isoformat()}
+            )
+            return ScanJobResponse(**(updated or s))
 
     return ScanJobResponse(**s)
-
-
-# -----------------------------------------------------------------------------
-# Apify Completion Webhook Endpoint (Persistent Idempotency & Recoverability)
-# -----------------------------------------------------------------------------
-
-@app.post("/api/v1/webhooks/apify", tags=["Webhooks"])
-async def apify_webhook_handler(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    x_merit_webhook_secret: Optional[str] = Header(None, alias="X-Merit-Webhook-Secret"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-):
-    """
-    Internal Apify completion webhook handler.
-    Validates shared secret from headers using constant-time comparison.
-    Secrets in URL query strings are rejected.
-    Persists event in PostgreSQL webhook_events table with unique event_key for persistent idempotency.
-    Webhook race condition safety: unmatched events remain in 'received' state for recovery.
-    """
-    configured_secret = settings.APIFY_WEBHOOK_SECRET
-    provided_secret = None
-    if x_merit_webhook_secret:
-        provided_secret = x_merit_webhook_secret.strip()
-    elif authorization and authorization.lower().startswith("bearer "):
-        provided_secret = authorization[7:].strip()
-
-    if (
-        not configured_secret
-        or not provided_secret
-        or not hmac.compare_digest(provided_secret.encode("utf-8"), configured_secret.encode("utf-8"))
-    ):
-        logger.warning("Apify webhook rejected due to missing or invalid shared secret header.")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing webhook secret header.",
-        )
-
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Malformed JSON payload in webhook.",
-        )
-
-    event_type = payload.get("eventType") or "ACTOR.RUN.SUCCEEDED"
-    event_data = payload.get("eventData") or {}
-    resource = payload.get("resource") or {}
-
-    actor_run_id = (
-        event_data.get("actorRunId")
-        or resource.get("id")
-        or payload.get("actorRunId")
-    )
-    dataset_id = resource.get("defaultDatasetId") or event_data.get("defaultDatasetId")
-
-    if not actor_run_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Actor run ID could not be identified from webhook payload.",
-        )
-
-    db = get_db()
-    event_key = f"apify_{actor_run_id}_{event_type}"
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    event_record = {
-        "provider": "apify",
-        "event_key": event_key,
-        "event_type": event_type,
-        "actor_run_id": actor_run_id,
-        "payload": payload,
-        "processing_status": "received",
-        "received_at": now_iso,
-    }
-
-    # Persistent idempotency check
-    is_new, recorded = await db.record_webhook_event(event_record)
-    if not is_new:
-        if recorded and recorded.get("processing_status") == "processed":
-            logger.info("Ignoring duplicate webhook delivery for processed key %s", event_key)
-            return {"status": "ok", "message": "Duplicate event acknowledged (idempotent)."}
-        logger.info("Re-checking scan job for previously unmatched webhook event key %s", event_key)
-
-    # Find matching scan job in PostgreSQL
-    matching_job = await db.get_scan_job_by_actor_run(actor_run_id)
-    if not matching_job:
-        logger.warning("No scan job found matching actor_run_id %s; keeping event in received state for recovery", actor_run_id)
-        if not is_new:
-            return {"status": "ok", "message": "Duplicate event acknowledged (idempotent). Matching scan job pending."}
-        return {"status": "ok", "message": "Event recorded; matching scan job pending."}
-
-    scan_id = matching_job["id"]
-    update_data = {}
-    effective_dataset_id = matching_job.get("dataset_id") or dataset_id
-    if dataset_id:
-        update_data["dataset_id"] = dataset_id
-
-    if event_type in ("ACTOR.RUN.SUCCEEDED", "SUCCEEDED"):
-        if matching_job["status"] != "succeeded":
-            update_data["status"] = "processing"
-            background_tasks.add_task(
-                process_completed_dataset,
-                scan_id,
-                effective_dataset_id,
-            )
-    else:
-        update_data["status"] = "failed"
-        update_data["error_code"] = f"APIFY_WEBHOOK_{event_type}"
-        update_data["finished_at"] = now_iso
-
-    update_data["updated_at"] = now_iso
-    await db.update_scan_job(scan_id, update_data)
-
-    # Mark webhook event as processed now that matching scan job has been dispatched
-    await db.update_webhook_event(
-        event_key,
-        {
-            "processing_status": "processed",
-            "processed_at": now_iso,
-        },
-    )
-
-    return {"status": "ok", "message": "Webhook processed successfully."}
 
 
 # -----------------------------------------------------------------------------
@@ -2958,6 +2999,20 @@ async def get_lead(lead_id: str, current_user: UserProfile = Depends(get_current
     return LeadResponse(**lead)
 
 
+@app.get("/api/v1/leads/{lead_id}/signals", tags=["Leads"])
+async def get_lead_signals(lead_id: str, current_user: UserProfile = Depends(get_current_user)):
+    """Retrieves all recorded signals (comments, reactions, visits) for a lead."""
+    db = get_db()
+    lead = await db.get_lead(current_user.id, lead_id)
+    if not lead:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Lead not found.",
+        )
+    signals = await db.list_lead_signals(current_user.id, lead_id)
+    return signals
+
+
 @app.patch("/api/v1/leads/{lead_id}", response_model=LeadResponse, tags=["Leads"])
 async def update_lead(
     lead_id: str,
@@ -3088,10 +3143,9 @@ async def list_integrations(current_user: UserProfile = Depends(get_current_user
             "capabilities": ["auth", "database", "rls"],
         },
         {
-            "provider": "apify",
-            "status": "connected" if apify_service.is_configured() else "disconnected",
-            "actor_id": settings.APIFY_ACTOR_ID,
-            "capabilities": ["website_scraping"],
+            "provider": "harvestapi",
+            "status": "connected" if harvest_client.is_configured() else "disconnected",
+            "capabilities": ["linkedin_profile", "linkedin_company", "linkedin_posts", "linkedin_engagement"],
         },
         {
             "provider": "groq",

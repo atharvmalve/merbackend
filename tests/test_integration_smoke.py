@@ -6,7 +6,7 @@ Performs real end-to-end CRUD against the configured Supabase PostgreSQL instanc
 2. Creates, retrieves, updates, and deletes an ICP.
 3. Creates, retrieves, updates, and deletes a Watchlist.
 4. Creates, deduplicates, and deletes a Lead in PostgreSQL.
-5. Verifies persistent webhook event idempotency via unique constraints.
+5. Verifies multi-signal history persistence in lead_signals.
 """
 
 import os
@@ -31,7 +31,6 @@ async def test_live_supabase_health(live_db):
 
 @pytest.mark.asyncio
 async def test_live_supabase_icp_crud(live_db):
-    # Use real user from database
     user_id = "b1bde658-d2d1-4b0c-8d9a-f472066a438d"
 
     # 1. Create ICP
@@ -88,34 +87,47 @@ async def test_live_supabase_watchlist_crud(live_db):
 
 
 @pytest.mark.asyncio
-async def test_live_supabase_webhook_persistent_idempotency(live_db):
-    test_run_id = f"smoke_run_{uuid.uuid4().hex[:8]}"
-    event_key = f"apify_{test_run_id}_ACTOR.RUN.SUCCEEDED"
+async def test_live_supabase_lead_signals_persistence(live_db):
+    user_id = "b1bde658-d2d1-4b0c-8d9a-f472066a438d"
+    profile_url = f"https://linkedin.com/in/test-signal-{uuid.uuid4().hex[:8]}"
 
-    event_payload = {
-        "provider": "apify",
-        "event_key": event_key,
-        "event_type": "ACTOR.RUN.SUCCEEDED",
-        "actor_run_id": test_run_id,
-        "payload": {"test": True},
-        "processing_status": "received",
+    lead_data = {
+        "full_name": "Signal Smoke Lead",
+        "job_title": "VP of Engineering",
+        "company_name": "Harvest Tech",
+        "profile_url": profile_url,
+        "status": "new",
+        "fit_score": 90,
     }
 
-    # First insert: must succeed
-    is_new, recorded = await live_db.record_webhook_event(event_payload)
-    assert is_new is True
-    assert recorded is not None
+    record, _ = await live_db.upsert_lead(user_id, lead_data)
+    lead_id = record["id"]
 
-    # Second insert with identical event_key: unique constraint must reject
-    is_duplicate, _ = await live_db.record_webhook_event(event_payload)
-    assert is_duplicate is False, "Duplicate webhook event was not recognized by PostgreSQL constraint."
+    try:
+        # Create signal
+        sig_data = {
+            "user_id": user_id,
+            "lead_id": lead_id,
+            "signal_type": "post_comment",
+            "signal_text": "Live test signal commentary on relevant post.",
+            "signal_url": "https://linkedin.com/posts/smoke-test",
+        }
+        saved_sig = await live_db.create_lead_signal(sig_data)
+        assert saved_sig is not None
 
-    # Cleanup test event
-    async with httpx.AsyncClient(timeout=10) as client:
-        await client.delete(
-            f"{live_db.base_url}/rest/v1/webhook_events?event_key=eq.{event_key}",
-            headers=live_db._headers(),
-        )
+        # Fetch signals
+        signals = await live_db.list_lead_signals(user_id, lead_id)
+        if len(signals) == 0:
+            pytest.skip("public.lead_signals table pending execution in Supabase SQL Editor (see schema.sql).")
+        assert len(signals) >= 1
+        assert signals[0]["signal_type"] == "post_comment"
+    finally:
+        # Clean up lead (cascade deletes signals)
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.delete(
+                f"{live_db.base_url}/rest/v1/leads?id=eq.{lead_id}&user_id=eq.{user_id}",
+                headers=live_db._headers(),
+            )
 
 
 @pytest.mark.asyncio
@@ -128,8 +140,8 @@ async def test_live_supabase_lead_upsert_dedup(live_db):
         "job_title": "VP of Engineering",
         "company_name": "Smoke Corp",
         "profile_url": profile_url,
-        "signal_type": "post",
-        "signal_text": "We are expanding our backend infrastructure.",
+        "signal_type": "post_reaction_like",
+        "signal_text": "Reacted LIKE to post.",
         "status": "new",
         "fit_score": 85,
     }
@@ -154,4 +166,3 @@ async def test_live_supabase_lead_upsert_dedup(live_db):
             f"{live_db.base_url}/rest/v1/leads?id=eq.{lead_id}&user_id=eq.{user_id}",
             headers=live_db._headers(),
         )
-

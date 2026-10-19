@@ -428,3 +428,42 @@ CREATE POLICY "integrations_delete_own" ON public.integrations
 -- -----------------------------------------------------------------------------
 -- Note: Leaving webhook_events with RLS enabled and NO policies for 'authenticated'
 -- or 'anon' ensures only service_role (which bypasses RLS in Postgres) can access it.
+
+
+-- -----------------------------------------------------------------------------
+-- 9. Lead Signals (Multi-evidence history per candidate)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.lead_signals (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    lead_id UUID NOT NULL REFERENCES public.leads(id) ON DELETE CASCADE,
+    watchlist_id UUID REFERENCES public.watchlists(id) ON DELETE SET NULL,
+    scan_job_id UUID REFERENCES public.scan_jobs(id) ON DELETE SET NULL,
+    signal_type TEXT NOT NULL,
+    signal_text TEXT,
+    signal_url TEXT,
+    signal_timestamp TIMESTAMPTZ,
+    raw_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
+);
+
+CREATE INDEX IF NOT EXISTS idx_lead_signals_lead_id ON public.lead_signals(lead_id);
+CREATE INDEX IF NOT EXISTS idx_lead_signals_user_id ON public.lead_signals(user_id);
+CREATE INDEX IF NOT EXISTS idx_lead_signals_scan_job_id ON public.lead_signals(scan_job_id);
+
+ALTER TABLE public.lead_signals ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "lead_signals_select_own" ON public.lead_signals;
+CREATE POLICY "lead_signals_select_own" ON public.lead_signals
+    FOR SELECT TO authenticated
+    USING (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "lead_signals_insert_own" ON public.lead_signals;
+CREATE POLICY "lead_signals_insert_own" ON public.lead_signals
+    FOR INSERT TO authenticated
+    WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "lead_signals_delete_own" ON public.lead_signals;
+CREATE POLICY "lead_signals_delete_own" ON public.lead_signals
+    FOR DELETE TO authenticated
+    USING (auth.uid() = user_id);
