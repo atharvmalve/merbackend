@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     SUPABASE_ANON_KEY: str = ""
     SUPABASE_SERVICE_ROLE_KEY: str = ""
 
-    HARVESTAPI_API_KEY: str = ""
+    HARVESTAPI_API_KEY: str = "Qx7Rwk5GITG0TDzQItCgxDbtdFN0WovO"
     HARVESTAPI_BASE_URL: str = "https://api.harvestapi.io"
 
     GROQ_API_KEY: str = ""
